@@ -58,8 +58,8 @@ class AuditReport(BaseModel):
 class ResumeAgentPipeline:
     def __init__(self, api_key: Optional[str] = None):
         self.client = genai.Client(api_key=api_key or os.getenv("GEMINI_API_KEY"))
-        self.fast_model = "gemini-2.0-flash"
-        self.reasoning_model = "gemini-2.0-flash"
+        self.fast_model = "gemini-3.6-flash"
+        self.reasoning_model = "gemini-3.6-flash"
 
     def _call_structured_llm(self, model: str, system_prompt: str, user_prompt: str, response_schema):
         response = self.client.models.generate_content(
