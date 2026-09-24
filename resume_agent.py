@@ -59,36 +59,33 @@ class AuditReport(BaseModel):
 class ResumeAgentPipeline:
     def __init__(self, api_key: Optional[str] = None):
         self.client = genai.Client(api_key=api_key or os.getenv("GEMINI_API_KEY"))
-        # Candidate models to try in sequence if one hits 503 capacity limits
-        self.models_to_try = ["gemini-3.6-flash", "gemini-3.8-flash", "gemini-2.5-flash"]
+        # Active production endpoint
+        self.model = "gemini-3.6-flash"
 
-    def _call_structured_llm(self, system_prompt: str, user_prompt: str, response_schema):
-        """Attempts generation across models with backoff retry on 503 high-demand errors."""
-        last_error = None
-        for model in self.models_to_try:
-            delay = 2
-            for attempt in range(3):
-                try:
-                    response = self.client.models.generate_content(
-                        model=model,
-                        contents=user_prompt,
-                        config=types.GenerateContentConfig(
-                            system_instruction=system_prompt,
-                            response_mime_type="application/json",
-                            response_schema=response_schema,
-                            temperature=0.1,
-                        )
+    def _call_structured_llm(self, system_prompt: str, user_prompt: str, response_schema, max_retries: int = 5):
+        """Calls Gemini with exponential backoff to handle 503 traffic surges."""
+        delay = 2
+        for attempt in range(max_retries):
+            try:
+                response = self.client.models.generate_content(
+                    model=self.model,
+                    contents=user_prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_prompt,
+                        response_mime_type="application/json",
+                        response_schema=response_schema,
+                        temperature=0.1,
                     )
-                    return response_schema.model_validate_json(response.text)
-                except Exception as e:
-                    last_error = e
-                    err_str = str(e)
-                    if "503" in err_str or "UNAVAILABLE" in err_str or "high demand" in err_str:
-                        time.sleep(delay)
-                        delay *= 2
-                        continue
-                    break  # If error is not 503, try next fallback model
-        raise last_error
+                )
+                return response_schema.model_validate_json(response.text)
+            except Exception as e:
+                err_text = str(e)
+                # Catch 503 capacity errors and wait for the Google inference spike to clear
+                if ("503" in err_text or "UNAVAILABLE" in err_text or "high demand" in err_text) and attempt < max_retries - 1:
+                    time.sleep(delay)
+                    delay *= 2  # Waits 2s, then 4s, 8s, 16s
+                    continue
+                raise e
 
     def parse_job_description(self, raw_jd: str) -> JobDescriptionAnalysis:
         return self._call_structured_llm(
