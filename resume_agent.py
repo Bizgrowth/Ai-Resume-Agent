@@ -1,5 +1,6 @@
 import os
 import json
+import time
 from typing import List, Optional
 from pydantic import BaseModel, Field
 from google import genai
@@ -58,25 +59,39 @@ class AuditReport(BaseModel):
 class ResumeAgentPipeline:
     def __init__(self, api_key: Optional[str] = None):
         self.client = genai.Client(api_key=api_key or os.getenv("GEMINI_API_KEY"))
-        self.fast_model = "gemini-3.6-flash"
-        self.reasoning_model = "gemini-3.6-flash"
+        # Candidate models to try in sequence if one hits 503 capacity limits
+        self.models_to_try = ["gemini-3.6-flash", "gemini-3.8-flash", "gemini-2.5-flash"]
 
-    def _call_structured_llm(self, model: str, system_prompt: str, user_prompt: str, response_schema):
-        response = self.client.models.generate_content(
-            model=model,
-            contents=user_prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=system_prompt,
-                response_mime_type="application/json",
-                response_schema=response_schema,
-                temperature=0.1,
-            )
-        )
-        return response_schema.model_validate_json(response.text)
+    def _call_structured_llm(self, system_prompt: str, user_prompt: str, response_schema):
+        """Attempts generation across models with backoff retry on 503 high-demand errors."""
+        last_error = None
+        for model in self.models_to_try:
+            delay = 2
+            for attempt in range(3):
+                try:
+                    response = self.client.models.generate_content(
+                        model=model,
+                        contents=user_prompt,
+                        config=types.GenerateContentConfig(
+                            system_instruction=system_prompt,
+                            response_mime_type="application/json",
+                            response_schema=response_schema,
+                            temperature=0.1,
+                        )
+                    )
+                    return response_schema.model_validate_json(response.text)
+                except Exception as e:
+                    last_error = e
+                    err_str = str(e)
+                    if "503" in err_str or "UNAVAILABLE" in err_str or "high demand" in err_str:
+                        time.sleep(delay)
+                        delay *= 2
+                        continue
+                    break  # If error is not 503, try next fallback model
+        raise last_error
 
     def parse_job_description(self, raw_jd: str) -> JobDescriptionAnalysis:
         return self._call_structured_llm(
-            self.fast_model,
             "You are an ATS parsing specialist. Strip corporate boilerplate. Extract exact skills, tools, and implied KPIs.",
             f"RAW JOB DESCRIPTION:\n{raw_jd}",
             JobDescriptionAnalysis
@@ -84,8 +99,7 @@ class ResumeAgentPipeline:
 
     def parse_candidate_profile(self, raw_resume: str) -> CandidateProfile:
         return self._call_structured_llm(
-            self.fast_model,
-            "Extract every factual entity from the candidate background. nstated tools.",
+            "Extract every factual entity from the candidate background. Do not infer unstated tools.",
             f"RAW CANDIDATE HISTORY:\n{raw_resume}",
             CandidateProfile
         )
@@ -93,7 +107,6 @@ class ResumeAgentPipeline:
     def analyze_skill_gap(self, jd: JobDescriptionAnalysis, profile: CandidateProfile) -> SkillGapReport:
         user_prompt = f"TARGET JD HARD SKILLS: {jd.hard_skills}\nTARGET JD CORE COMPETENCIES: {jd.core_competencies}\nCANDIDATE TOOLS INVENTORY: {profile.all_tools}"
         return self._call_structured_llm(
-            self.fast_model,
             "Identify exact matches, adjacent functional equivalents, and critical missing skills.",
             user_prompt,
             SkillGapReport
@@ -107,7 +120,6 @@ class ResumeAgentPipeline:
         )
         user_prompt = f"TARGET ROLE: {jd.target_role} ({jd.seniority_level})\nMATCHED KEYWORDS: {gaps.direct_keyword_matches}\nCANDIDATE DATA: {profile.model_dump_json()}\nAUDITOR FEEDBACK: {feedback or 'None'}"
         return self._call_structured_llm(
-            self.reasoning_model,
             system_instruction,
             user_prompt,
             OptimizedResume
@@ -116,7 +128,6 @@ class ResumeAgentPipeline:
     def audit_resume(self, resume: OptimizedResume, jd: JobDescriptionAnalysis, profile: CandidateProfile) -> AuditReport:
         user_prompt = f"TARGET JD SKILLS: {jd.hard_skills}\nCANDIDATE TOOLS: {profile.all_tools}\nSYNTHESIZED RESUME: {resume.model_dump_json()}"
         return self._call_structured_llm(
-            self.fast_model,
             "Check for hallucinations and verify strong ATS keyword inclusion. Return passed=True only if zero hallucinations.",
             user_prompt,
             AuditReport
@@ -134,4 +145,3 @@ class ResumeAgentPipeline:
             if audit.passed or attempt == max_retries:
                 return resume
             feedback = f"Revision needed: {audit.feedback}"
-          
